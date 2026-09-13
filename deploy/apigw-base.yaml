@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  kagerou API Gateway base — shared entrypoint for container preview
+  environments, with NO fixed monthly cost (HTTP API and VPC Link are billed
+  per request / not at all). Contrast with alb-base.yaml, where the load
+  balancer's fixed cost forces sharing.
+
+  Deploy ONCE per account/VPC: certificate, VPC Link, Cloud Map namespace and
+  ECS cluster. Each environment brings its own HTTP API + custom domain + DNS.
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Wildcard preview domain, e.g. api.example.com (URLs become pr-42.api.example.com)
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+
+Resources:
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Sub "*.${DomainName}"
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Sub "*.${DomainName}"
+          HostedZoneId: !Ref HostedZoneId
+
+  # VPC Link は HTTP API では追加課金なし(ENI は作られる)。
+  # ALB と違い「置いておくだけで月 18 ドル」が発生しない
+  VpcLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: kagerou API Gateway VPC Link
+      VpcId: !Ref VpcId
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: kagerou preview tasks (from the VPC Link only)
+      VpcId: !Ref VpcId
+
+  TaskIngressFromVpcLink:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref TaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref VpcLinkSecurityGroup
+
+  VpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: kagerou-preview
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: [!Ref VpcLinkSecurityGroup]
+
+  # 環境ごとにサービス検出名を登録する名前空間(Cloud Map)。
+  # ALB 版のターゲットグループに相当するが、こちらは DNS ベース
+  Namespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: kagerou.internal
+      Vpc: !Ref VpcId
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: kagerou-preview-apigw
+
+  # NOTE: API 本体・カスタムドメイン・DNS は **環境側**が持つ。
+  # HTTP API のルートキーは「メソッド + パス」で Host を見ないため、
+  # 1 つの API を共有すると全環境が ANY /{proxy+} を取り合って衝突する。
+  # API Gateway は固定費が無いので、環境ごとに API を作る方が素直
+  # (ALB は固定費があるので逆に共有するしかない — この差が設計を分ける)。
+
+  SsmDomain:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /kagerou/base/_shared-apigw/domain
+      Type: String
+      Value: !Ref DomainName
+  SsmCertificate:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /kagerou/base/_shared-apigw/certificate_arn
+      Type: String
+      Value: !Ref Certificate
+  SsmHostedZone:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /kagerou/base/_shared-apigw/hosted_zone_id
+      Type: String
+      Value: !Ref HostedZoneId
+  SsmVpcLink:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /kagerou/base/_shared-apigw/vpc_link_id
+      Type: String
+      Value: !Ref VpcLink
+  SsmNamespace:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /kagerou/base/_shared-apigw/namespace_id
+      Type: String
+      Value: !GetAtt Namespace.Id
+  SsmCluster:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /kagerou/base/_shared-apigw/cluster
+      Type: String
+      Value: !Ref Cluster
+  SsmTaskSg:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /kagerou/base/_shared-apigw/task_security_group
+      Type: String
+      Value: !Ref TaskSecurityGroup
+
+Outputs:
+  Domain:
+    Value: !Ref DomainName
+  CertificateArn:
+    Value: !Ref Certificate
+  HostedZoneId:
+    Value: !Ref HostedZoneId
+  VpcLinkId:
+    Value: !Ref VpcLink
+  NamespaceId:
+    Value: !GetAtt Namespace.Id
+  ClusterName:
+    Value: !Ref Cluster
+  TaskSecurityGroup:
+    Value: !Ref TaskSecurityGroup
+  Subnets:
+    Value: !Join [",", !Ref SubnetIds]

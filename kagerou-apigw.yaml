@@ -1,0 +1,15 @@
+# kagerou configuration(API Gateway 版。`kagerou up --config kagerou-apigw.yaml`)
+# 同じ 3 コンテナを、入口だけ API Gateway(HTTP API + VPC Link)に替えた構成。
+# API Gateway は固定費が無いので、環境が API・カスタムドメイン・DNS まで丸ごと持つ。
+# 共有ベースが持つのは証明書・VPC Link・Cloud Map 名前空間・ECS クラスタだけ。
+project: apigw-demo
+driver: stack
+template: template-apigw.yaml
+region: ap-northeast-1
+name_prefix: apigw-demo-
+ttl: 24h # Fargate は動いている間ずっと課金されるので短め
+url_template: "https://{name}.apigw.rikuka.dev"
+readiness_path: /healthz # Fargate の起動は 1〜2 分。応答するまで ready にしない
+readiness_timeout: 300s
+env:
+  KAGEROU_ENV: "{name}"

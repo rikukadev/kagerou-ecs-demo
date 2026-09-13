@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  kagerou ECS demo environment (API Gateway variant) — same three containers
+  as template.yaml, but the entrypoint is this environment's own HTTP API in
+  front of a shared VPC Link. API Gateway has no fixed cost, so each
+  environment can own its API, custom domain and DNS record; there is no shared
+  routing table, hence no target group and no rule priority to allocate.
+
+Parameters:
+  EnvKagerouEnv:
+    Type: String
+  EnvKagerouUrl:
+    Type: String
+    Default: ""
+  ImageUri:
+    Type: String
+  CertificateArn:
+    Type: String
+  HostedZoneId:
+    Type: String
+  VpcLinkId:
+    Type: String
+  NamespaceId:
+    Type: String
+  ClusterName:
+    Type: String
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  TaskSecurityGroup:
+    Type: String
+  HostName:
+    Type: String
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/kagerou/apigw/${EnvKagerouEnv}"
+      RetentionInDays: 3
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # ALB 版のターゲットグループの代わり。VPC Link はここを DNS で引く
+  DiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: !Ref EnvKagerouEnv
+      NamespaceId: !Ref NamespaceId
+      DnsConfig:
+        DnsRecords:
+          - Type: SRV # VPC Link 統合は SRV を要求する
+            TTL: 10
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "kagerou-apigw-${EnvKagerouEnv}"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      Volumes:
+        - Name: shared
+      ContainerDefinitions:
+        - Name: gateway
+          Image: !Ref ImageUri
+          Command: ["/gateway"] # CMD を上書きする(ENTRYPOINT では効かない)
+          PortMappings:
+            - ContainerPort: 8080
+          Environment:
+            - Name: KAGEROU_ENV
+              Value: !Ref EnvKagerouEnv
+            - Name: KAGEROU_URL
+              Value: !Ref EnvKagerouUrl
+            - Name: API_URL
+              Value: http://127.0.0.1:8081
+            - Name: SHARED_DIR
+              Value: /shared
+          MountPoints:
+            - SourceVolume: shared
+              ContainerPath: /shared
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: gateway
+        - Name: api
+          Image: !Ref ImageUri
+          Command: ["/api"]
+          Environment:
+            - Name: KAGEROU_ENV
+              Value: !Ref EnvKagerouEnv
+            - Name: PORT
+              Value: "8081"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+        - Name: worker
+          Image: !Ref ImageUri
+          Command: ["/worker"]
+          Environment:
+            - Name: KAGEROU_ENV
+              Value: !Ref EnvKagerouEnv
+            - Name: SHARED_DIR
+              Value: /shared
+          MountPoints:
+            - SourceVolume: shared
+              ContainerPath: /shared
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ClusterName
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryService.Arn
+          ContainerName: gateway
+          ContainerPort: 8080
+
+  # API Gateway は固定費が無いので、環境ごとに API を丸ごと持てる。
+  # ALB のように 1 つの入口を共有しないので、ルートキーの衝突も
+  # 優先度の採番も存在しない
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "kagerou-${EnvKagerouEnv}"
+      ProtocolType: HTTP
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref Api
+      StageName: $default
+      AutoDeploy: true
+
+  CustomDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Properties:
+      DomainName: !Ref HostName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref CertificateArn # ベースのワイルドカード証明書が覆う
+          EndpointType: REGIONAL
+
+  ApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Properties:
+      ApiId: !Ref Api
+      DomainName: !Ref CustomDomain
+      Stage: !Ref Stage
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref HostName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CustomDomain.RegionalDomainName
+        HostedZoneId: !GetAtt CustomDomain.RegionalHostedZoneId
+
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !GetAtt DiscoveryService.Arn
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLinkId
+      PayloadFormatVersion: "1.0"
+
+  # ALB 版の「リスナールール + 優先度」に相当。環境ごとに API が別なので
+  # 採番も衝突判定も要らない
+  Route:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: !Sub "ANY /{proxy+}"
+      Target: !Sub "integrations/${Integration}"
+
+Outputs:
+  KagerouUrl:
+    Value: !Sub "https://${HostName}"
+  ServiceName:
+    Value: !GetAtt Service.Name
