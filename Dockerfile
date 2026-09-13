@@ -16,4 +16,7 @@ ARG GIT_COMMIT=dev
 ARG BUILT_AT=dev
 ENV GIT_COMMIT=$GIT_COMMIT BUILT_AT=$BUILT_AT
 EXPOSE 8080
-ENTRYPOINT ["/gateway"]
+# ECS のタスク定義 Command は **CMD を上書きするが ENTRYPOINT は上書きしない**。
+# ENTRYPOINT にすると 3 コンテナ全部が gateway を起動し、awsvpc(ネットワーク
+# 共有)でポートが衝突する。1 イメージを command で使い分けるなら CMD にする。
+CMD ["/gateway"]

@@ -1,0 +1,83 @@
+# PR ごとのプレビュー環境(kagerou + ECS Fargate + 共有 ALB)。
+# 必要な Variables: AWS_ROLE_ARN / AWS_REGION / ECR_REPOSITORY /
+#   ALB_LISTENER_ARN / ECS_CLUSTER / VPC_ID / SUBNET_IDS / TASK_SECURITY_GROUP / PREVIEW_DOMAIN
+# (ALB 系はすべて共有ベース deploy/alb-base.yaml の Outputs を写したもの)
+name: pr-preview
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, closed]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: image
+        run: |
+          tag="pr-${{ github.event.pull_request.number }}-${GITHUB_SHA::7}"
+          uri="${{ vars.ECR_REPOSITORY }}:${tag}"
+          docker build \
+            --build-arg GIT_COMMIT="${GITHUB_SHA::7}" \
+            --build-arg BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "$uri" .
+          docker push "$uri"
+          echo "uri=$uri" >> "$GITHUB_OUTPUT"
+
+      # 共有リスナーにルールを足すので優先度が要る。環境名から決定的に導くと
+      # 同じ PR は常に同じ値(= 再実行で自分のルールを更新)になり、
+      # 別 PR とは衝突しにくい
+      - name: Derive listener rule priority
+        id: prio
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import zlib, os
+          name = f"pr-{os.environ['PR']}"
+          print(f"value={zlib.crc32(name.encode()) % 50000 + 1}")
+          PY
+        env:
+          PR: ${{ github.event.pull_request.number }}
+
+      - uses: rikukadev/kagerou/action@v0
+        with:
+          name: pr-${{ github.event.pull_request.number }}
+          param: |
+            ImageUri=${{ steps.image.outputs.uri }}
+            ListenerArn=${{ vars.ALB_LISTENER_ARN }}
+            ClusterName=${{ vars.ECS_CLUSTER }}
+            VpcId=${{ vars.VPC_ID }}
+            SubnetIds=${{ vars.SUBNET_IDS }}
+            TaskSecurityGroup=${{ vars.TASK_SECURITY_GROUP }}
+            HostName=pr-${{ github.event.pull_request.number }}.${{ vars.PREVIEW_DOMAIN }}
+            RulePriority=${{ steps.prio.outputs.value }}
+
+  cleanup:
+    if: github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: rikukadev/kagerou/action@v0
+        with:
+          name: pr-${{ github.event.pull_request.number }}
+          down: "true"
