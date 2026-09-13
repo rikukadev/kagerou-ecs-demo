@@ -1,0 +1,14 @@
+# kagerou configuration (https://github.com/rikukadev/kagerou)
+# 本物のコンテナを 3 つ(gateway / api / worker)立てる構成。compute は ECS Fargate、
+# 入口は共有 ALB。環境が作るのはリスナールールとターゲットグループだけで、
+# ALB 本体(固定費のあるもの)は共有ベースが持つ。
+project: ecs-demo
+driver: stack
+region: ap-northeast-1
+name_prefix: ecs-demo-
+ttl: 24h # Fargate は動いている間ずっと課金されるので短め
+url_template: "https://{name}.ecs.rikuka.dev"
+readiness_path: /healthz # Fargate の起動は 1〜2 分。応答するまで ready にしない
+readiness_timeout: 300s
+env:
+  KAGEROU_ENV: "{name}"
